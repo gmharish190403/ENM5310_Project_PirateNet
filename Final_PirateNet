@@ -1,0 +1,309 @@
+import jax
+import jax.numpy as jnp
+from jax import random, grad, jit, vmap
+import optax
+import matplotlib.pyplot as plt
+import time
+
+P = 195.0
+v = 800e-3
+r0 = 52.5e-6
+eta = 0.35
+rho = 8440.0
+cp = 450.0
+k = 10.0
+T_inf = 298.0
+Tm = 1593.0
+
+L_x = 1.5e-3
+L_y = 0.75e-3
+L_z = 0.5e-3
+
+Pe = rho * cp * v * L_x / k
+T_scale = eta * P / (k * L_x)
+
+a = 1.5*r0
+b = 2*r0
+c_f = 2*r0
+c_r = 4*r0
+f_f = 0.6
+f_r = 1.4
+
+def goldak(xi, y, z):
+    r2 = (y/a)**2 + (z/b)**2
+    front = jnp.where(xi >= 0, 6*jnp.sqrt(3)*f_f/(a*b*c_f*jnp.pi*jnp.sqrt(jnp.pi)) * jnp.exp(-3*r2 - 3*(xi/c_f)**2), 0.0)
+    rear = jnp.where(xi < 0, 6*jnp.sqrt(3)*f_r/(a*b*c_r*jnp.pi*jnp.sqrt(jnp.pi)) * jnp.exp(-3*r2 - 3*(xi/c_r)**2), 0.0)
+    return (front + rear) / T_scale
+
+class PirateNet:
+    def __init__(self, key):
+        key, k = random.split(key)
+        w0 = random.normal(k, (3, 128)) * jnp.sqrt(2.0/3)
+        b0 = jnp.zeros(128)
+        self.input = (w0, b0)
+        
+        blocks = []
+        for _ in range(6):
+            key, k1, k2, k3 = random.split(key, 4)
+            wu = random.normal(k1, (128, 128)) * jnp.sqrt(2.0/128)
+            bu = jnp.zeros(128)
+            wv = random.normal(k2, (128, 128)) * jnp.sqrt(2.0/128)
+            bv = jnp.zeros(128)
+            ww = random.normal(k3, (128, 128)) * jnp.sqrt(2.0/128)
+            bw = jnp.zeros(128)
+            blocks.append(((wu, bu), (wv, bv), (ww, bw)))
+        self.blocks = blocks
+        
+        key, k = random.split(key)
+        wf = random.normal(k, (128, 1)) * jnp.sqrt(2.0/128)
+        bf = jnp.zeros(1)
+        self.output = (wf, bf)
+
+def normalize(xi, y, z):
+    xi_n = 2*(xi + L_x/2)/L_x - 1
+    y_n = 2*(y + L_y)/L_y - 1
+    z_n = 2*z/L_z + 1
+    return jnp.stack([xi_n, y_n, z_n], axis=-1)
+
+def pn_fwd(p, x):
+    inp, blks, out = p
+    w, b = inp
+    x = jnp.tanh(x @ w + b)
+    for (wu, bu), (wv, bv), (ww, bw) in blks:
+        u = jnp.tanh(x @ wu + bu)
+        v = jnp.tanh(x @ wv + bv)
+        w = jnp.tanh(x @ ww + bw)
+        x = x + u * v + (1 - v) * w
+    w, b = out
+    return x @ w + b
+
+def compute_loss(params, key, epoch, max_epochs, lambda_vals):
+    n = 10000
+    xi = random.uniform(key, (n,), minval=-L_x/2, maxval=L_x/2)
+    key, k = random.split(key)
+    y = random.uniform(k, (n,), minval=-L_y, maxval=L_y)
+    key, k = random.split(key)
+    z = random.uniform(k, (n,), minval=-L_z, maxval=0)
+    
+    def T_fn(xi, y, z):
+        X = normalize(xi, y, z)
+        return pn_fwd(params, X).squeeze()
+    
+    def residual(xi, y, z):
+        dxi = grad(T_fn, argnums=0)(xi, y, z)
+        d2xi = grad(grad(T_fn, argnums=0), argnums=0)(xi, y, z)
+        d2y = grad(grad(T_fn, argnums=1), argnums=1)(xi, y, z)
+        d2z = grad(grad(T_fn, argnums=2), argnums=2)(xi, y, z)
+        Q = goldak(xi, y, z)
+        return Pe * dxi - (d2xi + d2y + d2z) - Q
+    
+    res = vmap(residual)(xi, y, z)
+    loss_pde = jnp.mean(res**2)
+    
+    n_bc = 500
+    key, k = random.split(key)
+    xi_bc = random.uniform(k, (n_bc,), minval=-L_x/2, maxval=L_x/2)
+    key, k = random.split(key)
+    y_bc = random.uniform(k, (n_bc,), minval=-L_y, maxval=L_y)
+    
+    X_bc = normalize(xi_bc, y_bc, jnp.zeros(n_bc))
+    T_top = vmap(lambda x: pn_fwd(params, x).squeeze())(X_bc)
+    loss_bc = jnp.mean(T_top**2)
+    
+    causal_weight = jnp.exp(-5.0 * (1.0 - epoch / max_epochs))
+    
+    lambda_pde, lambda_bc = lambda_vals
+    total = causal_weight * (lambda_pde * loss_pde + lambda_bc * loss_bc)
+    
+    return total, (loss_pde, loss_bc)
+
+def train():
+    pn = PirateNet(random.PRNGKey(0))
+    params = (pn.input, pn.blocks, pn.output)
+    
+    log_lambda_pde = jnp.log(1.0)
+    log_lambda_bc = jnp.log(10.0)
+    lambda_vals = (log_lambda_pde, log_lambda_bc)
+    
+    optimizer = optax.adam(1e-3)
+    opt_state = optimizer.init(params)
+    
+    lambda_optimizer = optax.adam(1e-4)
+    lambda_opt_state = lambda_optimizer.init(lambda_vals)
+    
+    max_epochs = 30000
+    
+    @jit
+    def step(p, s, lam, lam_s, k, ep):
+        def loss_fn(params, lambdas):
+            l_pde = jnp.exp(lambdas[0])
+            l_bc = jnp.exp(lambdas[1])
+            total, _ = compute_loss(params, k, ep, max_epochs, (l_pde, l_bc))
+            return total
+        
+        total_loss, grads = jax.value_and_grad(loss_fn)(p, lam)
+        updates, s = optimizer.update(grads, s)
+        p = optax.apply_updates(p, updates)
+        
+        _, (pde_loss, bc_loss) = compute_loss(p, k, ep, max_epochs, (jnp.exp(lam[0]), jnp.exp(lam[1])))
+        
+        def lambda_loss(lambdas):
+            l_pde = jnp.exp(lambdas[0])
+            l_bc = jnp.exp(lambdas[1])
+            return -jnp.log(l_pde + 1e-8) * pde_loss - jnp.log(l_bc + 1e-8) * bc_loss
+        
+        lambda_grads = grad(lambda_loss)(lam)
+        lambda_updates, lam_s = lambda_optimizer.update(lambda_grads, lam_s)
+        lam = optax.apply_updates(lam, lambda_updates)
+        
+        return p, s, lam, lam_s, total_loss, pde_loss, bc_loss
+    
+    key = random.PRNGKey(42)
+    losses = []
+    pde_losses = []
+    bc_losses = []
+    lambda_pde_history = []
+    lambda_bc_history = []
+    t0 = time.time()
+    
+    for epoch in range(max_epochs):
+        key, k = random.split(key)
+        params, opt_state, lambda_vals, lambda_opt_state, loss, pde_l, bc_l = step(
+            params, opt_state, lambda_vals, lambda_opt_state, k, epoch
+        )
+        
+        losses.append(float(loss))
+        pde_losses.append(float(pde_l))
+        bc_losses.append(float(bc_l))
+        lambda_pde_history.append(float(jnp.exp(lambda_vals[0])))
+        lambda_bc_history.append(float(jnp.exp(lambda_vals[1])))
+        
+        if epoch % 5000 == 0:
+            print(f"{epoch}: Loss={loss:.3e}, PDE={pde_l:.3e}, BC={bc_l:.3e}, λ_pde={jnp.exp(lambda_vals[0]):.2f}, λ_bc={jnp.exp(lambda_vals[1]):.2f}")
+    
+    train_time = time.time() - t0
+    
+    return params, losses, pde_losses, bc_losses, lambda_pde_history, lambda_bc_history, train_time
+
+def eval_model(params):
+    xi = jnp.linspace(-L_x/2, L_x/2, 100)
+    y = jnp.linspace(-L_y, L_y, 100)
+    z = jnp.linspace(-L_z, 0, 50)
+    
+    XI, Y = jnp.meshgrid(xi, y, indexing='ij')
+    X_surf = normalize(XI.flatten(), Y.flatten(), jnp.zeros(XI.size))
+    T_surf = vmap(lambda x: pn_fwd(params, x).squeeze())(X_surf)
+    T_surf = (T_surf.reshape(XI.shape) * T_scale + T_inf)
+    
+    XI, Z = jnp.meshgrid(xi, z, indexing='ij')
+    X_xz = normalize(XI.flatten(), jnp.zeros(XI.size), Z.flatten())
+    T_xz = vmap(lambda x: pn_fwd(params, x).squeeze())(X_xz)
+    T_xz = (T_xz.reshape(XI.shape) * T_scale + T_inf)
+    
+    YI, Z = jnp.meshgrid(y, z, indexing='ij')
+    X_yz = normalize(jnp.zeros(YI.size), YI.flatten(), Z.flatten())
+    T_yz = vmap(lambda x: pn_fwd(params, x).squeeze())(X_yz)
+    T_yz = (T_yz.reshape(YI.shape) * T_scale + T_inf)
+    
+    depth = float(jnp.abs(z[jnp.max(jnp.where(T_xz[50, :] > Tm, jnp.arange(len(z)), 0))])) * 1e6
+    width = float(2 * jnp.abs(y[jnp.max(jnp.where(T_surf[:, 0] > Tm, jnp.arange(len(y)), 0))])) * 1e6
+    
+    return T_surf, T_xz, T_yz, xi, y, z, depth, width
+
+print("Training Final PirateNet with Causal + Adaptive Weights...")
+params, loss, pde_loss, bc_loss, lam_pde, lam_bc, train_t = train()
+
+T_surf, T_xz, T_yz, xi, y, z, depth, width = eval_model(params)
+
+print(f"\nFinal Loss: {loss[-1]:.3e}")
+print(f"Training Time: {train_t:.1f}s")
+print(f"Melt Pool Depth: {depth:.1f} um")
+print(f"Melt Pool Width: {width:.1f} um")
+print(f"AM-Bench: Depth=36±2 um, Width=123±3 um")
+
+fig = plt.figure(figsize=(16, 10))
+
+ax1 = plt.subplot(3, 3, 1)
+c1 = ax1.contourf(xi*1e3, z*1e6, T_xz.T, 20, cmap='hot')
+ax1.contour(xi*1e3, z*1e6, T_xz.T, [Tm], colors='cyan', linewidths=2)
+ax1.set_xlabel('xi [mm]')
+ax1.set_ylabel('z [um]')
+ax1.set_title('XZ Plane (y=0)')
+plt.colorbar(c1, ax=ax1, label='T [K]')
+
+ax2 = plt.subplot(3, 3, 2)
+c2 = ax2.contourf(xi*1e3, y*1e3, T_surf, 20, cmap='hot')
+ax2.contour(xi*1e3, y*1e3, T_surf, [Tm], colors='cyan', linewidths=2)
+ax2.set_xlabel('xi [mm]')
+ax2.set_ylabel('y [mm]')
+ax2.set_title('Surface (z=0)')
+plt.colorbar(c2, ax=ax2, label='T [K]')
+
+ax3 = plt.subplot(3, 3, 3)
+c3 = ax3.contourf(y*1e3, z*1e6, T_yz.T, 20, cmap='hot')
+ax3.contour(y*1e3, z*1e6, T_yz.T, [Tm], colors='cyan', linewidths=2)
+ax3.set_xlabel('y [mm]')
+ax3.set_ylabel('z [um]')
+ax3.set_title('YZ Plane (xi=0)')
+plt.colorbar(c3, ax=ax3, label='T [K]')
+
+ax4 = plt.subplot(3, 3, 4)
+ax4.plot(loss)
+ax4.set_yscale('log')
+ax4.set_xlabel('Epoch')
+ax4.set_ylabel('Total Loss')
+ax4.set_title('Training Loss')
+ax4.grid(True, alpha=0.3)
+
+ax5 = plt.subplot(3, 3, 5)
+ax5.plot(pde_loss, label='PDE')
+ax5.plot(bc_loss, label='BC')
+ax5.set_yscale('log')
+ax5.set_xlabel('Epoch')
+ax5.set_ylabel('Loss')
+ax5.set_title('Loss Components')
+ax5.legend()
+ax5.grid(True, alpha=0.3)
+
+ax6 = plt.subplot(3, 3, 6)
+ax6.plot(lam_pde, label='λ_PDE')
+ax6.plot(lam_bc, label='λ_BC')
+ax6.set_xlabel('Epoch')
+ax6.set_ylabel('Weight')
+ax6.set_title('Adaptive Weights')
+ax6.legend()
+ax6.grid(True, alpha=0.3)
+
+ax7 = plt.subplot(3, 3, 7)
+T_centerline = T_xz[50, :]
+ax7.plot(z*1e6, T_centerline, 'b-', linewidth=2)
+ax7.axhline(Tm, color='r', linestyle='--', label='Melting Point')
+ax7.set_xlabel('z [um]')
+ax7.set_ylabel('T [K]')
+ax7.set_title('Centerline Temperature')
+ax7.legend()
+ax7.grid(True, alpha=0.3)
+
+ax8 = plt.subplot(3, 3, 8)
+T_surface = T_surf[50, :]
+ax8.plot(y*1e3, T_surface, 'b-', linewidth=2)
+ax8.axhline(Tm, color='r', linestyle='--', label='Melting Point')
+ax8.set_xlabel('y [mm]')
+ax8.set_ylabel('T [K]')
+ax8.set_title('Surface Temperature Profile')
+ax8.legend()
+ax8.grid(True, alpha=0.3)
+
+ax9 = plt.subplot(3, 3, 9)
+ax9.text(0.1, 0.8, f"Final Results:", fontsize=12, fontweight='bold', transform=ax9.transAxes)
+ax9.text(0.1, 0.65, f"Loss: {loss[-1]:.2e}", fontsize=11, transform=ax9.transAxes)
+ax9.text(0.1, 0.55, f"Time: {train_t:.0f}s", fontsize=11, transform=ax9.transAxes)
+ax9.text(0.1, 0.45, f"Depth: {depth:.1f} μm", fontsize=11, transform=ax9.transAxes)
+ax9.text(0.1, 0.35, f"Width: {width:.1f} μm", fontsize=11, transform=ax9.transAxes)
+ax9.text(0.1, 0.2, "AM-Bench:", fontsize=11, fontweight='bold', transform=ax9.transAxes)
+ax9.text(0.1, 0.1, "Depth: 36±2 μm\nWidth: 123±3 μm", fontsize=10, color='red', transform=ax9.transAxes)
+ax9.axis('off')
+
+plt.tight_layout()
+plt.savefig('final_piratenet.png', dpi=200)
+plt.show()
